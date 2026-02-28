@@ -1,0 +1,197 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: dsia_postgres
+    environment:
+      POSTGRES_DB: universite
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - dsia_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d universite"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongo:
+    image: mongo:6
+    container_name: dsia_mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin123
+      MONGO_INITDB_DATABASE: universite_nosql
+    ports:
+      - "27017:27017"
+    volumes:
+      - ./data/init_mongo.js:/docker-entrypoint-initdb.d/init.js
+      - mongo_data:/data/db
+    networks:
+      - dsia_network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/universite_nosql --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: dsia_api
+    ports:
+      - "8000:8000"
+    networks:
+      - dsia_network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 30s
+
+  minio:
+    image: minio/minio:latest
+    container_name: dsia_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - dsia_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio_init:
+    image: minio/mc:latest
+    container_name: dsia_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin123;
+      mc mb --ignore-existing local/bronze;
+      mc mb --ignore-existing local/silver;
+      mc mb --ignore-existing local/gold;
+      echo 'Buckets OK';
+      exit 0;
+      "
+    networks:
+      - dsia_network
+
+  ingestion:
+    build:
+      context: ./ingestion
+      dockerfile: Dockerfile
+    container_name: dsia_ingestion
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+      minio_init:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: universite
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      MONGO_URI: mongodb://admin:admin123@mongo:27017/universite_nosql?authSource=admin
+      API_URL: http://api:8000
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin123
+    networks:
+      - dsia_network
+
+  spark-master:
+    image: apache/spark:3.5.4
+    container_name: dsia_spark_master
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    networks:
+      - dsia_network
+
+  spark-worker:
+    image: apache/spark:3.5.4
+    container_name: dsia_spark_worker
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_WEBUI_PORT=8081
+    ports:
+      - "8081:8081"
+    depends_on:
+      - spark-master
+    networks:
+      - dsia_network
+
+  transformation:
+    build:
+      context: ./transformation
+      dockerfile: Dockerfile
+    container_name: dsia_transformation
+    depends_on:
+      spark-master:
+        condition: service_started
+      ingestion:
+        condition: service_completed_successfully
+    environment:
+      SPARK_MASTER: spark://spark-master:7077
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin123
+    networks:
+      - dsia_network
+
+  jupyter:
+    image: quay.io/jupyter/pyspark-notebook:latest
+    container_name: dsia_jupyter
+    ports:
+      - "8888:8888"
+    environment:
+      JUPYTER_ENABLE_LAB: "yes"
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin123
+    volumes:
+      - ./notebooks:/home/jovyan/work
+    depends_on:
+      - minio
+      - spark-master
+    networks:
+      - dsia_network
+    command: start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
+
+volumes:
+  postgres_data:
+  mongo_data:
+  minio_data:
+
+networks:
+  dsia_network:
+    driver: bridge
